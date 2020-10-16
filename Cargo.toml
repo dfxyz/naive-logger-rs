@@ -1,0 +1,10 @@
+[package]
+name = "naive_logger"
+version = "0.1.0"
+authors = ["DF_XYZ <dfxyz1@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+log = "0.4"
+chrono = "0.4"
+crossbeam-channel = "0.4"
