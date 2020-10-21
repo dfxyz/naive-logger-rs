@@ -1,8 +1,7 @@
 fn main() {
-    let config = naive_logger::LoggerConfig::default();
-    let _ = naive_logger::init(config);
+    let _logger = naive_logger::init(naive_logger::LoggerConfig::default());
+
     log::info!("too young");
     log::warn!("too simple");
     log::error!("sometimes naive");
-    naive_logger::shutdown();
 }

@@ -1,9 +1,22 @@
 //! A young, simple and naive asynchronous logger implementation.
+//!
+//! Workflow:
+//! * call "init()" in "main()":
+//!     * allocate an [`Arc<Logger>`] in main thread's stack
+//!     * allocate an static [`Weak<Logger>`] which implements [`Log`] trait
+//!     * spawn the logger thread and send a [`LoggerInternal`] into it
+//!     * call [`log::set_logger`] and [`log::set_max_level`]
+//! * spawn other threads and use macros in [`log`] to record logs
+//! * when "main()" returns, the only [`Arc<Logger>`] instance will be dropped and
+//! the shutdown procedure will be executed:
+//!     * send a shutdown message to the log thread
+//!     * wait log thread to finish
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
-use std::io::{stdout, Seek, SeekFrom, Write, ErrorKind};
-use std::ptr::null_mut;
+use std::io::{stdout, ErrorKind, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -15,11 +28,11 @@ pub struct LoggerConfig {
     /// Use stdout to output the log?
     pub use_stdout: bool,
     /// The path of the main log file. If empty, won't output log to file.
-    pub file_path: String,
+    pub log_file_path: String,
     /// Limit the log file size in bytes. If 0, won't rotate the log file.
-    pub file_max_size: u64,
+    pub log_file_max_size: u64,
     /// Limit the number of rotated log files. If 0, won't rotate the log file.
-    pub rotated_file_num: u64,
+    pub rotated_log_file_num: u64,
 }
 
 impl Default for LoggerConfig {
@@ -27,9 +40,9 @@ impl Default for LoggerConfig {
         LoggerConfig {
             level: Level::Info,
             use_stdout: true,
-            file_path: "".to_string(),
-            file_max_size: 0,
-            rotated_file_num: 0,
+            log_file_path: "".to_string(),
+            log_file_max_size: 0,
+            rotated_log_file_num: 0,
         }
     }
 }
@@ -40,49 +53,60 @@ enum LoggerMessage {
     Shutdown,
 }
 
-struct Logger {
+pub struct Logger {
     level: Level,
     sender: Sender<LoggerMessage>,
-    join_handle: JoinHandle<()>,
+    join_handle: Option<JoinHandle<()>>,
 }
+
+struct LoggerWeakRef(Weak<Logger>);
 
 struct LoggerInternal {
     config: LoggerConfig,
     receiver: Receiver<LoggerMessage>,
-    file_ptr: Cell<*mut File>,
-    file_size: Cell<u64>,
-    file_paths: Vec<String>,
+    log_file: RefCell<Option<File>>,
+    log_file_size: Cell<u64>,
+    log_file_paths: Vec<String>,
 }
 
 unsafe impl Send for LoggerInternal {}
 
-static mut LOGGER: Option<Logger> = None;
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static mut LOGGER_WEAK_REF: Option<LoggerWeakRef> = None;
 
-/// Initialize the logger. Should be called only once.
-pub fn init(config: LoggerConfig) -> Result<(), String> {
+pub fn init(config: LoggerConfig) -> Result<Arc<Logger>, String> {
+    if INITIALIZED.compare_and_swap(false, true, Ordering::Relaxed) {
+        return Err("already initialized".into());
+    }
+
     let level = config.level;
     let level_filter = level.to_level_filter();
 
-    let file_path = config.file_path.as_str();
-    let file_ptr;
-    let file_size;
-    let file_paths;
-    if !file_path.is_empty() {
-        let mut file = match OpenOptions::new().create(true).write(true).open(file_path) {
+    let log_file_path = config.log_file_path.as_str();
+    let log_file;
+    let log_file_size;
+    let log_file_paths;
+    if !log_file_path.is_empty() {
+        let mut file = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(log_file_path)
+        {
             Ok(f) => f,
             Err(e) => {
                 return Err(format!(
                     "failed to open the log file '{}': {}",
-                    file_path, e
+                    log_file_path, e
                 ))
             }
         };
+
         let metadata = match file.metadata() {
             Ok(m) => {
                 if m.is_dir() {
                     return Err(format!(
                         "failed to open the log file '{}'; it's a directory",
-                        file_path
+                        log_file_path
                     ));
                 }
                 m
@@ -90,29 +114,30 @@ pub fn init(config: LoggerConfig) -> Result<(), String> {
             Err(e) => {
                 return Err(format!(
                     "failed to read metadata from the log file '{}': {}",
-                    file_path, e
+                    log_file_path, e
                 ))
             }
         };
+
         if let Err(e) = file.seek(SeekFrom::End(0)) {
             return Err(format!("failed to set the log file cursor: {}", e));
         }
 
-        file_ptr = Box::into_raw(Box::new(file));
-        file_size = metadata.len();
-        file_paths = {
-            let rotated_file_num = config.rotated_file_num as usize;
+        log_file = RefCell::new(Some(file));
+        log_file_size = Cell::new(metadata.len());
+        log_file_paths = {
+            let rotated_file_num = config.rotated_log_file_num as usize;
             let mut v = Vec::with_capacity(rotated_file_num);
-            v.push(file_path.to_string());
+            v.push(log_file_path.to_string());
             for i in 1..=rotated_file_num {
-                v.push(format!("{}.{}", file_path, i));
+                v.push(format!("{}.{}", log_file_path, i));
             }
             v
         }
     } else {
-        file_ptr = null_mut();
-        file_size = 0;
-        file_paths = vec![];
+        log_file = RefCell::new(None);
+        log_file_size = Cell::new(0);
+        log_file_paths = vec![];
     }
 
     let (sender, receiver) = crossbeam_channel::unbounded();
@@ -120,73 +145,83 @@ pub fn init(config: LoggerConfig) -> Result<(), String> {
     let internal = LoggerInternal {
         config,
         receiver,
-        file_ptr: Cell::new(file_ptr),
-        file_size: Cell::new(file_size),
-        file_paths,
+        log_file,
+        log_file_size,
+        log_file_paths,
     };
     let join_handle = match std::thread::Builder::new()
         .name("naive_logger".to_string())
         .spawn(move || {
             internal.run();
         }) {
-        Ok(h) => h,
+        Ok(h) => Some(h),
         Err(e) => return Err(format!("failed to spawn the logger thread: {}", e)),
     };
 
-    let logger = Logger {
+    let logger = Arc::new(Logger {
         level,
         sender,
         join_handle,
-    };
-    unsafe { LOGGER = Some(logger) };
+    });
+    let weak = LoggerWeakRef(Arc::downgrade(&logger));
+    unsafe { LOGGER_WEAK_REF = Some(weak) };
 
     log::set_max_level(level_filter);
-    if log::set_logger(unsafe { LOGGER.as_ref().unwrap() }).is_err() {
-        eprintln!("failed to active the logger");
+    if log::set_logger(unsafe { LOGGER_WEAK_REF.as_ref().unwrap() }).is_err() {
+        eprintln!("failed to set as the global logger");
     }
 
-    Ok(())
+    Ok(logger)
 }
 
-/// Make sure the logs are flushed and close the logger.
-/// Will block and wait for the logger thread to finish.
-pub fn shutdown() {
-    let logger = unsafe { LOGGER.take().unwrap() };
-    logger.shutdown();
+impl LoggerWeakRef {
+    #[inline]
+    fn upgrade(&self) -> Option<Arc<Logger>> {
+        self.0.upgrade()
+    }
 }
 
-impl Log for Logger {
+impl Log for LoggerWeakRef {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        self.level >= metadata.level()
+        if let Some(logger) = self.upgrade() {
+            logger.level >= metadata.level()
+        } else {
+            false
+        }
     }
 
     fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            let datetime = chrono::Local::now().format("%F %T%.3f");
-            let message = format!(
-                "[{}][{:>5}][{}]: {}\n",
-                datetime,
-                record.level(),
-                record.target(),
-                record.args()
-            );
-            let _ = self.sender.send(LoggerMessage::Log(message));
+        if let Some(logger) = self.upgrade() {
+            if logger.level >= record.level() {
+                let datetime = chrono::Local::now().format("%F %T%.3f");
+                let message = format!(
+                    "[{}][{:>5}][{}]: {}\n",
+                    datetime,
+                    record.level(),
+                    record.target(),
+                    record.args()
+                );
+                let _ = logger.sender.send(LoggerMessage::Log(message));
+            }
         }
     }
 
     fn flush(&self) {
-        let _ = self.sender.send(LoggerMessage::Flush);
+        if let Some(logger) = self.upgrade() {
+            let _ = logger.sender.send(LoggerMessage::Flush);
+        }
     }
 }
 
-impl Logger {
-    fn shutdown(self) {
+impl Drop for Logger {
+    fn drop(&mut self) {
         let _ = self.sender.send(LoggerMessage::Shutdown);
-        let _ = self.join_handle.join();
+        let _ = self.join_handle.take().unwrap().join();
     }
 }
 
 impl LoggerInternal {
+    #[inline]
     fn run(&self) {
         for msg in &self.receiver {
             match msg {
@@ -202,18 +237,22 @@ impl LoggerInternal {
         if self.config.use_stdout {
             print!("{}", &message);
         }
-        let file_ptr = self.file_ptr.get();
-        if !file_ptr.is_null() {
-            let file = unsafe { file_ptr.as_mut().unwrap() };
+        let mut log_file_ref = self.log_file.borrow_mut();
+        if let Some(file) = log_file_ref.as_mut() {
             let msg = message.as_bytes();
             match file.write_all(msg) {
                 Ok(_) => {
-                    let new_size = self.file_size.get() + msg.len() as u64;
-                    self.file_size.set(new_size);
+                    let max_size = self.config.log_file_max_size;
+                    if max_size == 0 || self.config.rotated_log_file_num == 0 {
+                        return; // rotating disabled, no need to update the log file size
+                    }
 
-                    let max_size = self.config.file_max_size;
-                    if max_size != 0 && new_size > max_size {
+                    let new_size = self.log_file_size.get() + msg.len() as u64;
+                    if new_size >= max_size {
+                        drop(log_file_ref);
                         self.rotate_log_files();
+                    } else {
+                        self.log_file_size.set(new_size);
                     }
                 }
                 Err(e) => eprintln!("logger failed to write file: {}", e),
@@ -221,29 +260,14 @@ impl LoggerInternal {
         }
     }
 
-    fn flush(&self) {
-        if self.config.use_stdout {
-            if let Err(e) = stdout().flush() {
-                eprintln!("logger failed to flush the stdout: {}", e);
-            };
-        }
-        let file_ptr = self.file_ptr.get();
-        if !file_ptr.is_null() {
-            let file = unsafe { file_ptr.as_mut().unwrap() };
-            if let Err(e) = file.flush() {
-                eprintln!("logger failed to flush the file: {}", e);
-            }
-        }
-    }
-
     fn rotate_log_files(&self) {
-        let rotated_file_num = self.config.rotated_file_num;
+        let rotated_file_num = self.config.rotated_log_file_num;
         if rotated_file_num == 0 {
             return;
         }
 
         // rotate files
-        let file_paths = &self.file_paths;
+        let file_paths = &self.log_file_paths;
         for i in (0..rotated_file_num).rev() {
             let src = file_paths[i as usize].as_str();
             let dst = file_paths[(i + 1) as usize].as_str();
@@ -255,32 +279,34 @@ impl LoggerInternal {
         }
 
         // reset the active file
-        let file_ptr = self.file_ptr.get();
-        let file = unsafe { file_ptr.as_mut().unwrap() };
-        if let Err(e) = file.set_len(0) {
-            // fatal error, release resources, disable file outputting
-            eprintln!("logger failed to truncate the file: {}", e);
-            unsafe { Box::from_raw(file_ptr) };
-            self.file_ptr.set(null_mut());
-            return;
-        }
-        if let Err(e) = file.seek(SeekFrom::Start(0)) {
-            // fatal error, release resources, disable file outputting
-            eprintln!("logger failed to reset the log file cursor: {}", e);
-            unsafe { Box::from_raw(file_ptr) };
-            self.file_ptr.set(null_mut());
-            return;
+        if let Some(file) = self.log_file.borrow_mut().as_mut() {
+            if let Err(e) = file.set_len(0) {
+                // fatal error, release resources, disable file outputting
+                eprintln!("logger failed to truncate the file: {}", e);
+                self.log_file.borrow_mut().take();
+                return;
+            }
+            if let Err(e) = file.seek(SeekFrom::Start(0)) {
+                // fatal error, release resources, disable file outputting
+                eprintln!("logger failed to reset the log file cursor: {}", e);
+                self.log_file.borrow_mut().take();
+                return;
+            }
         }
 
-        self.file_size.set(0);
+        self.log_file_size.set(0);
     }
-}
 
-impl Drop for LoggerInternal {
-    fn drop(&mut self) {
-        let file_ptr = self.file_ptr.get();
-        if !file_ptr.is_null() {
-            unsafe { Box::from_raw(file_ptr) };
+    fn flush(&self) {
+        if self.config.use_stdout {
+            if let Err(e) = stdout().flush() {
+                eprintln!("logger failed to flush the stdout: {}", e);
+            };
+        }
+        if let Some(file) = self.log_file.borrow_mut().as_mut() {
+            if let Err(e) = file.flush() {
+                eprintln!("logger failed to flush the file: {}", e);
+            }
         }
     }
 }
